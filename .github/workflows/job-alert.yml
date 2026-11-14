@@ -2,8 +2,8 @@ name: LinkedIn job alert
 
 on:
   schedule:
-    - cron: "*/15 5-21 * * *"
-  workflow_dispatch:
+    - cron: "*/15 5-21 * * *"   # ogni 15 min, 6:00-22:59 ora italiana (UTC+1)
+  workflow_dispatch:            # per lanciarlo a mano
 
 permissions:
   contents: write
@@ -15,6 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,8 +27,11 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID_ALICE: ${{ secrets.TELEGRAM_CHAT_ID_ALICE }}
+          TELEGRAM_CHAT_ID_EDOARDO: ${{ secrets.TELEGRAM_CHAT_ID_EDOARDO }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PROFILO: ${{ secrets.PROFILO }}
+          PROFILO_EDOARDO: ${{ secrets.PROFILO_EDOARDO }}
       - name: Salva offerte già viste
         run: |
           git config user.name "job-bot"
