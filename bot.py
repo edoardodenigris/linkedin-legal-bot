@@ -1,14 +1,13 @@
 """
-LinkedIn -> Telegram job alert bot (v2).
+LinkedIn -> Telegram job alert bot — multi-profilo.
 
-Flusso per ogni esecuzione:
-  1. Ricerca: per ogni keyword interroga l'endpoint pubblico (guest) di LinkedIn,
-     offerte delle ultime TIME_WINDOW_SEC secondi in zona Milano.
-  2. Pre-filtro sul titolo: scarta stage/tirocini e titoli palesemente fuori ambito.
-  3. Dettaglio: per ogni offerta nuova scarica la pagina con descrizione e settore.
-  4. Scoring: decide se e' pertinente guardando titolo + descrizione.
-  5. Esclusione studi legali tramite il SETTORE LinkedIn (non solo il nome).
-  6. Notifica su Telegram con il motivo del match, e salva gli ID visti.
+Per ogni profilo definito in profiles.py, a ogni esecuzione:
+  1. cerca su LinkedIn (endpoint pubblico, nessun login) le offerte delle ultime 2 ore;
+  2. scarta localita' fuori zona e titoli esclusi;
+  3. scarica descrizione e settore delle offerte nuove;
+  4. le filtra con le regole del profilo;
+  5. le fa valutare a Claude Haiku rispetto al profilo della persona (se configurato);
+  6. le manda su Telegram e ricorda quelle gia' viste.
 """
 import json
 import os
@@ -21,114 +20,17 @@ from urllib.parse import urlencode
 import requests
 from bs4 import BeautifulSoup
 
+from profiles import KEEP_IN_BOILERPLATE, LOCATIONS, PROFILES
+
 # =====================================================================
-# CONFIG — tutto quello che serve modificare sta qui
+# CONFIG GENERALE
 # =====================================================================
-
-# Profilo cercato: legal in-house "generalista" (contratti, societario, IP/marchi,
-# compliance 231, privacy, contenzioso) in aziende tipo moda, automotive, retail, industria.
-
-# Ricerche su Milano e dintorni (LinkedIn cerca in titolo + descrizione)
-SEARCH_KEYWORDS = [
-    "legal",
-    "legal counsel",
-    "legal specialist",
-    "in-house counsel",
-    "legal affairs",
-    "legal manager",
-    "head of legal",
-    "giurista",
-    "ufficio legale",
-    "affari legali",
-    "specialista legale",
-    "contract manager",
-    "contrattualistica",
-    "paralegal",
-    "compliance",
-    "privacy specialist",
-    "data protection",
-    "modello 231",
-    "AI Act",
-    "corporate governance",
-    "segreteria societaria",
-    "antitrust",
-    "trademark",
-    "intellectual property",
-]
-LOCATION = "Milano, Lombardia, Italia"
-DISTANCE_MILES = 25           # ~40 km
-
-# Ricerche full remote su tutta Italia (sottoinsieme, per non appesantire)
-REMOTE_KEYWORDS = [
-    "legal counsel",
-    "legal specialist",
-    "legal",
-    "giurista",
-    "contract manager",
-    "compliance",
-    "privacy specialist",
-]
-REMOTE_GEO_ID = "103350119"   # geoId LinkedIn dell'Italia (il testo "Italia" non basta)
-# Paracadute: scarta qualsiasi offerta la cui localita' non sia in Italia
-LOCATION_REQUIRED = re.compile(r"ital(ia|y|ien)", re.I)
-
-TIME_WINDOW_SEC = 7200        # ultime 2h (con dedup copre i ritardi del cron)
-MAX_DETAILS_PER_RUN = 60      # tetto alle pagine dettaglio per esecuzione
-MIN_SCORE = 3                 # soglia di pertinenza (vedi score())
-
-# --- Titolo: segnali forti (bastano da soli) ---
-TITLE_STRONG = [
-    r"legal", r"lawyer", r"attorney", r"counsel", r"jurist", r"giurist", r"legale",
-    r"avvocat", r"paralegal", r"contract\s*(manag|special|admin)", r"contrattualistic",
-    r"\bdpo\b", r"data\s*protection", r"privacy", r"antitrust", r"litigation",
-    r"contenzios", r"corporate\s*secretar", r"segreteria\s*societari",
-    r"affari\s*(legali|societari)", r"trademark", r"\bmarchi\b", r"intellectual\s*property",
-    r"propriet[aà]\s*intellettuale", r"\bip\s*(counsel|specialist|manager)", r"brand\s*protection",
-]
-# --- Titolo: segnali medi (servono conferme nella descrizione) ---
-TITLE_MEDIUM = [
-    r"compliance", r"regulatory", r"regolator", r"governance", r"\b231\b",
-    r"ai\s*act", r"gdpr", r"risk", r"rischi", r"whistleblow", r"anti.?money|aml\b|antiriciclaggio",
-    r"public\s*affairs", r"corporate\s*affairs",
-]
-# --- Descrizione: termini "core" giuridici (almeno uno serve per i titoli medi) ---
-DESC_CORE = [
-    r"giurisprudenza", r"laurea\s+in\s+legge", r"law\s+degree", r"\bdiritto\s+(commerciale|societario|civile|del\s+lavoro|amministrativo|bancario|industriale|dei\s+contratti)",
-    r"(ufficio|area|funzione|direzione|consulenza|assistenza)\s+legal[ei]", r"affari\s+legali",
-    r"legal\s+(department|team|function|affairs|counsel|advice|support|matters)",
-    r"avvocat", r"abilitazione\s+(all'esercizio|forense)", r"bar\s+admission",
-    r"contrattualistic", r"redazione\s+(di\s+)?contratti", r"(drafting|negotiat\w*)\s+(of\s+)?(commercial\s+)?contracts",
-    r"\bgiuridic",
-]
-# --- Descrizione: termini di dominio (ognuno distinto vale 1 punto) ---
-DESC_DOMAIN = {
-    "GDPR": r"gdpr",
-    "data protection": r"data\s+protection",
-    "privacy": r"privacy",
-    "231": r"(modello|d\.?\s?lgs\.?)\s*(n\.?\s*)?231|\b231/2001",
-    "OdV": r"organismo\s+di\s+vigilanza|\bodv\b",
-    "AI Act": r"ai\s+act",
-    "NIS2": r"\bnis\s?2\b",
-    "DORA": r"\bdora\b",
-    "antitrust": r"antitrust",
-    "due diligence": r"due\s+diligence",
-    "governance": r"corporate\s+governance",
-    "contenzioso": r"contenzios|litigation",
-    "whistleblowing": r"whistleblowing",
-    "AML": r"antiriciclaggio|anti.?money\s+laundering",
-    "normativa": r"normativ",
-    "regulatory": r"regulatory",
-    "compliance": r"compliance",
-    "segreteria societaria": r"segreteria\s+societaria|assemble[ae]\s+(dei\s+)?soci|board\s+meeting",
-    "IP": r"propriet[aà]\s+intellettuale|intellectual\s+property",
-    "marchi": r"\bmarchi\b|trademark|brand\s+protection|anticontraffazione|counterfeit",
-    "licensing": r"licensing|contratti\s+di\s+licenza",
-    "distribuzione": r"(contratti|accordi)\s+di\s+(distribuzione|agenzia|franchising|fornitura)|"
-                     r"distribution\s+agreements?|franchis|dealer\s+agreements?|supply\s+agreements?",
-    "consumatori": r"codice\s+del\s+consumo|consumer\s+(law|protection)|product\s+liability|"
-                   r"responsabilit[aà]\s+(da\s+)?prodotto",
-    "societario": r"diritto\s+societario|corporate\s+law|operazioni\s+straordinarie|\bm&a\b",
-}
+TIME_WINDOW_SEC = 7200          # offerte delle ultime 2h (con dedup copre i ritardi)
+SEARCH_PAUSE_SEC = 2            # pausa tra una ricerca e l'altra
+MAX_DETAILS_PER_PROFILE = 40    # tetto pagine dettaglio per profilo per esecuzione
+AI_MODEL = "claude-haiku-5-5"
+AI_MAX_CALLS_PER_PROFILE = 20   # tetto di sicurezza sui costi
+AI_PRICE_IN, AI_PRICE_OUT = 0.10, 0.50   # USD per milione di token (Haiku 5.5, prompt < 100K)
 
 # Frasi "di rito" a fondo annuncio: vengono tolte dalla descrizione prima dello scoring
 BOILERPLATE = re.compile(
@@ -143,38 +45,12 @@ BOILERPLATE = re.compile(
     re.I,
 )
 
-# Esclusioni
-TITLE_EXCLUDE = re.compile(
-    r"praticant|stage\b|stagista|tirocin|\bintern\b|internship|"
-    r"sales|commerciale|venditor|engineer|developer|sviluppator|"
-    r"\bit\s+(compliance|security)|cyber|infermier|medic[oa]\b|medico\s+legale|"
-    r"legal\s+entit|contabil|accountant|regulatory\s+affairs|affari\s+regolatori|"
-    r"quality|qualit[aà]|\bhse\b|\behs\b|ambiente\s+e\s+sicurezza",
-    re.I,
-)
-# Studi legali: per settore LinkedIn (affidabile) + fallback sul nome
-INDUSTRY_EXCLUDE = re.compile(
-    r"law\s+practice|legal\s+services|studi\s+legali|servizi\s+legali|attivit[aà]\s+legali",
-    re.I,
-)
-COMPANY_EXCLUDE = re.compile(
-    r"\bstudio\b|avvocati|law\s*firm|\bllp\b|&\s*partners|associati|\bsta\b",
-    re.I,
-)
 
 # =====================================================================
 
 STATE_FILE = Path(__file__).with_name("seen.json")
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TG_CHAT_IDS = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-PROFILO = os.environ.get("PROFILO", "").strip()
-AI_MODEL = "claude-haiku-5-5"
-AI_MAX_CALLS_PER_RUN = 30          # tetto di sicurezza sui costi
-AI_ENABLED = bool(ANTHROPIC_API_KEY and PROFILO)
-# Prezzi Haiku 5.5 (USD per milione di token, prompt < 100K) per stimare la spesa
-AI_PRICE_IN, AI_PRICE_OUT = 0.10, 0.50
-AI_STATE = {"spent": 0.0, "out_of_credit": False}   # aggiornato durante l'esecuzione
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
@@ -182,11 +58,14 @@ HEADERS = {
 }
 SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 DETAIL_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{}"
+AI_STATE = {"spent": 0.0, "out_of_credit": False}
 
-_rx = lambda pats: [re.compile(p, re.I) for p in pats]
-TITLE_STRONG_RX, TITLE_MEDIUM_RX = _rx(TITLE_STRONG), _rx(TITLE_MEDIUM)
-DESC_CORE_RX = _rx(DESC_CORE)
-DESC_DOMAIN_RX = {k: re.compile(v, re.I) for k, v in DESC_DOMAIN.items()}
+
+def env_list(name: str) -> list[str]:
+    return [c.strip() for c in os.environ.get(name, "").split(",") if c.strip()]
+
+
+DEFAULT_CHAT_IDS = env_list("TELEGRAM_CHAT_ID")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -201,7 +80,7 @@ def get(url: str) -> requests.Response | None:
         if r is not None and r.status_code == 200:
             return r
         code = r.status_code if r is not None else "ERR"
-        print(f"[warn] HTTP {code} su {url[:90]}… (tentativo {attempt + 1})")
+        print(f"[warn] HTTP {code} su {url[:100]}… (tentativo {attempt + 1})")
         if r is not None and r.status_code in (400, 404):
             return None
         time.sleep(10 * (attempt + 1))
@@ -209,19 +88,10 @@ def get(url: str) -> requests.Response | None:
 
 
 # ---------------------------------------------------------------- SEARCH
-def search(keyword: str, remote: bool = False) -> tuple[list[dict], bool]:
-    params = {
-        "keywords": keyword,
-        "location": "Italia" if remote else LOCATION,
-        "f_TPR": f"r{TIME_WINDOW_SEC}",
-        "sortBy": "DD",
-        "start": 0,
-    }
-    if remote:
-        params["f_WT"] = 2          # 2 = full remote
-        params["geoId"] = REMOTE_GEO_ID
-    else:
-        params["distance"] = DISTANCE_MILES
+def search(keyword: str, loc_key: str, extra: dict) -> tuple[list[dict], bool]:
+    loc = LOCATIONS[loc_key]
+    params = {"keywords": keyword, **loc["params"], **extra,
+              "f_TPR": f"r{TIME_WINDOW_SEC}", "sortBy": "DD", "start": 0}
     r = get(f"{SEARCH_URL}?{urlencode(params)}")
     if r is None:
         return [], False
@@ -232,15 +102,19 @@ def search(keyword: str, remote: bool = False) -> tuple[list[dict], bool]:
         if not m:
             continue
         t = lambda sel: (el.get_text(strip=True) if (el := card.select_one(sel)) else "")
-        jobs.append({
+        job = {
             "id": m.group(1),
             "title": t("h3.base-search-card__title"),
             "company": t("h4.base-search-card__subtitle"),
             "location": t("span.job-search-card__location"),
             "posted": t("time"),
             "url": f"https://www.linkedin.com/jobs/view/{m.group(1)}/",
-            "remote": remote,
-        })
+            "remote": bool(loc.get("remote")),
+        }
+        # paracadute: la localita' dell'annuncio deve essere coerente con la ricerca
+        if job["location"] and not re.search(loc["allow"], job["location"], re.I):
+            continue
+        jobs.append(job)
     return jobs, True
 
 
@@ -254,169 +128,63 @@ def fetch_detail(job: dict) -> bool:
     job["description"] = desc.get_text(" ", strip=True) if desc else ""
     criteria = {}
     for li in soup.select("li.description__job-criteria-item"):
-        k = li.select_one("h3")
-        v = li.select_one("span")
+        k, v = li.select_one("h3"), li.select_one("span")
         if k and v:
             criteria[k.get_text(strip=True).lower()] = v.get_text(" ", strip=True)
-    job["industry"] = next(
-        (v for k, v in criteria.items() if "industr" in k or "settor" in k), ""
-    )
-    job["seniority"] = next(
-        (v for k, v in criteria.items() if "seniority" in k or "livello" in k), ""
-    )
+    job["industry"] = next((v for k, v in criteria.items() if "industr" in k or "settor" in k), "")
+    job["seniority"] = next((v for k, v in criteria.items() if "seniority" in k or "livello" in k), "")
     return True
-
-
-# ---------------------------------------------------------------- SCORING
-def hits(rxs, text):
-    return [rx.pattern for rx in rxs if rx.search(text)]
 
 
 def strip_boilerplate(text: str) -> str:
     """Toglie le frasi standard su privacy/GDPR/pari opportunita'."""
     sentences = re.split(r"(?<=[.!?;])\s+|\s{2,}|\n", text)
-    keep = DESC_DOMAIN_RX["231"], DESC_DOMAIN_RX["AI Act"], DESC_DOMAIN_RX["OdV"]
     return " ".join(
         x for x in sentences
-        if not BOILERPLATE.search(x) or any(k.search(x) for k in keep)
+        if not BOILERPLATE.search(x) or any(k.search(x) for k in KEEP_IN_BOILERPLATE)
     )
 
 
-# termini troppo generici per far passare da soli un titolo non legal
-WEAK_DOMAIN = {"normativa", "compliance", "regulatory", "privacy", "GDPR"}
-
-
-def score(job: dict) -> tuple[int, str]:
-    """
-    Regole:
-      - titolo forte                         -> +3 (passa da solo)
-      - titolo medio                         -> +1, e la descrizione deve avere
-                                                almeno 1 termine 'core' giuridico
-      - ogni termine di dominio distinto nella descrizione -> +1 (max 4)
-      - descrizione senza titolo pertinente  -> passa solo con core + >=3 termini
-                                                di dominio specifici (non generici)
-    Prima dello scoring la descrizione viene ripulita dalle frasi di rito
-    (informativa privacy, GDPR, pari opportunita').
-    Ritorna (punteggio, motivo leggibile).
-    """
-    title, desc = job["title"], strip_boilerplate(job.get("description", ""))
-    strong = hits(TITLE_STRONG_RX, title)
-    medium = hits(TITLE_MEDIUM_RX, title)
-    core = hits(DESC_CORE_RX, desc)
-    domain = [k for k, rx in DESC_DOMAIN_RX.items() if rx.search(desc)]
-
-    s = 0
-    if strong:
-        s += 3
-    elif medium:
-        s += 1 if core else -10
-    elif not (core and len([d for d in domain if d not in WEAK_DOMAIN]) >= 3):
-        s -= 10
-    s += min(len(domain), 4)
-
-    why = []
-    if strong or medium:
-        why.append("titolo")
-    if domain:
-        why.append("descr.: " + ", ".join(domain[:6]))
-    return s, " | ".join(why)
-
-
-def excluded(job: dict) -> str | None:
-    if job.get("location") and not LOCATION_REQUIRED.search(job["location"]):
-        return "fuori Italia"
-    if TITLE_EXCLUDE.search(job["title"]):
-        return "titolo escluso"
-    if job.get("industry") and INDUSTRY_EXCLUDE.search(job["industry"]):
-        return "studio legale (settore)"
-    if COMPANY_EXCLUDE.search(job["company"]):
-        return "studio legale (nome)"
-    return None
-
-
-# ---------------------------------------------------------------- TELEGRAM
-def esc(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def tg_send(text: str, silent: bool = False) -> bool:
-    """Invia a tutte le chat. Riprova su errori temporanei (5xx, 429, rete).
-    Ritorna False se dopo i tentativi l'invio non e' riuscito."""
-    ok_all = True
-    for chat_id in TG_CHAT_IDS:
-        for attempt in range(4):
-            try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                          "disable_web_page_preview": True,
-                          "disable_notification": silent},
-                    timeout=20,
-                )
-            except requests.RequestException as e:
-                print(f"[warn] Telegram: {e}")
-                r = None
-            if r is not None and r.ok:
-                break
-            wait = 5 * (attempt + 1)
-            if r is not None:
-                print(f"[warn] Telegram HTTP {r.status_code}: {r.text[:150]}")
-                if r.status_code == 429:
-                    wait = r.json().get("parameters", {}).get("retry_after", wait) + 1
-                elif r.status_code < 500:
-                    break  # errore non temporaneo (es. chat id sbagliato): inutile riprovare
-            time.sleep(wait)
-        else:
-            ok_all = False
-            continue
-        if r is None or not r.ok:
-            ok_all = False
-    return ok_all
-
-
-AI_SYSTEM = """Sei un assistente che valuta offerte di lavoro per una candidata.
-Ecco il suo profilo:
+# ---------------------------------------------------------------- AI
+AI_SYSTEM = """Valuti offerte di lavoro per una persona che cerca lavoro. Ecco il suo profilo:
 
 <profilo>
 {profilo}
 </profilo>
 
-Valuta quanto l'offerta che ricevi e' adatta a lei, seguendo il profilo (in particolare
-la sezione su cosa escludere). Rispondi SOLO con un oggetto JSON valido, senza testo
-prima o dopo, con questi campi:
+Valuta quanto l'offerta che ricevi e' adatta a questa persona, seguendo il profilo
+(in particolare vincoli, esclusioni e soglie economiche). Se la retribuzione e' indicata
+in un'altra valuta o su base mensile/oraria, convertila in RAL annua lorda in euro.
+Rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo, con questi campi:
 {{
   "voto": intero da 1 a 5 (5 = perfetta, 1 = da scartare),
-  "in_house": true se e' un ruolo dentro un'azienda o un ente, false se studio legale o societa' di consulenza,
-  "seniority": stringa breve, es. "junior", "mid (3-5 anni)", "senior (7+ anni)", "non indicata",
+  "in_target": true se il tipo di datore di lavoro e di ruolo rientra in cio' che cerca,
+  "seniority": stringa breve, es. "mid (3-5 anni)", "senior (7+ anni)", "manager", "non indicata",
+  "ral": RAL indicata nell'annuncio in forma breve (es. "55-65k EUR"), "" se non indicata,
   "sintesi": massimo 15 parole in italiano su cosa si fa concretamente nel ruolo,
-  "attenzione": stringa breve con eventuali requisiti o condizioni che potrebbero escluderla
-                (lingue particolari, trasferte, contratto a termine, sede diversa), "" se nessuno
+  "attenzione": stringa breve con requisiti o condizioni che potrebbero escluderla
+                (lingue, trasferimento, trasferte, contratto a termine, RAL sotto soglia,
+                remoto non possibile dall'Italia), "" se nessuno
 }}"""
 
 
-def ai_review(job: dict) -> dict | None:
+def ai_review(job: dict, profile_text: str) -> dict | None:
     """Chiede a Claude Haiku una valutazione dell'offerta. None se qualcosa va storto."""
     desc = strip_boilerplate(job.get("description", ""))[:6000]
     ad = (
         f"Titolo: {job['title']}\nAzienda: {job['company']}\n"
         f"Settore: {job.get('industry') or 'n.d.'}\nLocalita': {job['location']}"
-        f"{' (full remote)' if job.get('remote') else ''}\n"
+        f"{' (annuncio full remote)' if job.get('remote') else ''}\n"
         f"Seniority LinkedIn: {job.get('seniority') or 'n.d.'}\n\nDescrizione:\n{desc}"
     )
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": AI_MODEL,
-                "max_tokens": 400,
-                "system": AI_SYSTEM.format(profilo=PROFILO),
-                "messages": [{"role": "user", "content": ad}],
-            },
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": AI_MODEL, "max_tokens": 400,
+                  "system": AI_SYSTEM.format(profilo=profile_text),
+                  "messages": [{"role": "user", "content": ad}]},
             timeout=60,
         )
         if not r.ok:
@@ -436,18 +204,52 @@ def ai_review(job: dict) -> dict | None:
             return None
         data["voto"] = max(1, min(5, data["voto"]))
         return data
-    except (requests.RequestException, ValueError, json.JSONDecodeError) as e:
+    except (requests.RequestException, ValueError) as e:
         print(f"[warn] AI errore: {e}")
         return None
 
 
-def notify(job: dict, why: str, ai: dict | None = None) -> bool:
+# ---------------------------------------------------------------- TELEGRAM
+def esc(s) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def tg_send(text: str, chat_ids: list[str], silent: bool = False) -> bool:
+    """Invia a tutte le chat. Riprova su errori temporanei (5xx, 429, rete)."""
+    ok_all = True
+    for chat_id in chat_ids:
+        r = None
+        for attempt in range(4):
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                          "disable_web_page_preview": True, "disable_notification": silent},
+                    timeout=20,
+                )
+            except requests.RequestException as e:
+                print(f"[warn] Telegram: {e}")
+                r = None
+            if r is not None and r.ok:
+                break
+            wait = 5 * (attempt + 1)
+            if r is not None:
+                print(f"[warn] Telegram HTTP {r.status_code}: {r.text[:150]}")
+                if r.status_code == 429:
+                    wait = r.json().get("parameters", {}).get("retry_after", wait) + 1
+                elif r.status_code < 500:
+                    break  # errore non temporaneo: inutile riprovare
+            time.sleep(wait)
+        if r is None or not r.ok:
+            ok_all = False
+    return ok_all
+
+
+def notify(profile: dict, job: dict, why: str, ai: dict | None, chat_ids: list[str]) -> bool:
+    head = f"{profile['emoji']} <b>{esc(profile['name'])}</b> · "
     if ai:
         v = ai["voto"]
-        badge = "🔥" if v >= 4 else ("⬇️" if v <= 2 else "🆗")
-        head = f"{badge} <b>{v}/5</b> · "
-    else:
-        head = "🆕 "
+        head += ("🔥" if v >= 4 else "⬇️" if v <= 2 else "🆗") + f" <b>{v}/5</b> · "
     if job.get("remote"):
         head += "🏠 <b>REMOTO</b> · "
     lines = [
@@ -457,118 +259,121 @@ def notify(job: dict, why: str, ai: dict | None = None) -> bool:
     ]
     if ai:
         if ai.get("sintesi"):
-            lines.append(f"📝 {esc(str(ai['sintesi']))}")
+            lines.append(f"📝 {esc(ai['sintesi'])}")
         sen = str(ai.get("seniority") or "")
         if sen and "non indicat" not in sen.lower():
             lines.append(f"👤 {esc(sen)}")
-        if ai.get("in_house") is False:
-            lines.append("🚫 <i>Sembra studio legale / consulenza</i>")
+        if ai.get("ral"):
+            lines.append(f"💰 {esc(ai['ral'])}")
+        if ai.get("in_target") is False:
+            lines.append("🚫 <i>Fuori target (tipo di azienda o ruolo)</i>")
         if ai.get("attenzione"):
-            lines.append(f"⚠️ {esc(str(ai['attenzione']))}")
+            lines.append(f"⚠️ {esc(ai['attenzione'])}")
     else:
         lines.append(f"🔎 <i>{esc(why)}</i>")
     lines.append(job["url"])
-    # voto basso: arriva lo stesso, ma senza suono
-    return tg_send("\n".join(lines), silent=bool(ai and ai["voto"] <= 2))
+    return tg_send("\n".join(lines), chat_ids, silent=bool(ai and ai["voto"] <= 2))
 
 
 # ---------------------------------------------------------------- STATE
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"seen": [], "last_warn": 0}
+        return {"seen": []}
     data = json.loads(STATE_FILE.read_text() or "[]")
-    if isinstance(data, list):  # compatibilita' con la v1
-        return {"seen": data, "last_warn": 0}
+    if isinstance(data, list):
+        data = {"seen": data}
+    # compatibilita': gli ID senza prefisso erano tutti del profilo di Alice
+    data["seen"] = [x if ":" in x else f"alice:{x}" for x in data.get("seen", [])]
     return data
 
 
 def save_state(state: dict) -> None:
-    state["seen"] = sorted(set(state["seen"]))[-8000:]
+    state["seen"] = sorted(set(state["seen"]))[-15000:]
     STATE_FILE.write_text(json.dumps(state))
 
 
-# ---------------------------------------------------------------- MAIN
-def main() -> None:
-    state = load_state()
-    seen = set(state["seen"])
+# ---------------------------------------------------------------- RUN
+def run_profile(profile: dict, seen: set) -> tuple[int, int, dict]:
+    """Ritorna (ricerche ok, ricerche totali, statistiche)."""
+    name = profile["name"]
+    chat_ids = env_list(profile["chat_env"]) or DEFAULT_CHAT_IDS
+    profile_text = os.environ.get(profile["profile_env"], "").strip()
+    ai_on = bool(ANTHROPIC_API_KEY and profile_text)
 
-    # 1. ricerca
     found: dict[str, dict] = {}
-    ok_searches = 0
-    searches = [(kw, False) for kw in SEARCH_KEYWORDS] + [(kw, True) for kw in REMOTE_KEYWORDS]
-    for kw, remote in searches:
-        jobs, ok = search(kw, remote)
-        ok_searches += ok
+    ok = 0
+    for kw, loc_key in profile["searches"]:
+        jobs, success = search(kw, loc_key, profile["extra_params"])
+        ok += success
         for j in jobs:
             prev = found.setdefault(j["id"], j)
             prev["remote"] = prev["remote"] or j["remote"]
-        time.sleep(3)
+        time.sleep(SEARCH_PAUSE_SEC)
 
-    # Se LinkedIn ci blocca del tutto: avviso su Telegram (max 1 ogni 12h) e fallisco
-    if ok_searches == 0:
-        if time.time() - state.get("last_warn", 0) > 12 * 3600:
-            tg_send("⚠️ <b>Job bot</b>: LinkedIn non risponde a nessuna ricerca. "
-                    "Controlla i log su GitHub Actions.")
-            state["last_warn"] = time.time()
-            save_state(state)
-        sys.exit(1)
+    key = lambda jid: f"{profile['key']}:{jid}"
+    new = [j for jid, j in found.items() if key(jid) not in seen]
+    print(f"\n=== {name}: ricerche OK {ok}/{len(profile['searches'])} · "
+          f"trovate {len(found)} · nuove {len(new)} · AI {'on' if ai_on else 'off'}")
 
-    new = [j for jid, j in found.items() if jid not in seen]
-    print(f"Ricerche OK {ok_searches}/{len(searches)} · "
-          f"offerte trovate {len(found)} · nuove {len(new)}")
-
-    # 2-5. valutazione (lo stato viene salvato anche se qualcosa va storto)
     stats: dict[str, int] = {}
+    details = ai_calls = 0
+    for job in new:
+        reason = profile["excluded"](job)
+        if reason is None:
+            if details >= MAX_DETAILS_PER_PROFILE:
+                continue  # resta non vista: la valuto al prossimo giro
+            details += 1
+            if not fetch_detail(job):
+                continue
+            time.sleep(1.5)
+            reason = profile["excluded"](job)
+        if reason is None:
+            s, why = profile["relevance"](job, strip_boilerplate(job.get("description", "")))
+            if s >= profile["min_score"]:
+                ai = None
+                if ai_on and ai_calls < AI_MAX_CALLS_PER_PROFILE and not AI_STATE["out_of_credit"]:
+                    ai_calls += 1
+                    ai = ai_review(job, profile_text)
+                if not notify(profile, job, why, ai, chat_ids):
+                    print(f"  invio fallito: {job['title']} — riprovo al prossimo giro")
+                    continue
+                time.sleep(3)  # Telegram: max ~20 messaggi/minuto per gruppo
+                reason = f"inviata (AI {ai['voto']}/5)" if ai else "inviata"
+            else:
+                reason = "poco pertinente"
+            print(f"  [{s:>3}] {reason:<18} {job['title']} — {job['company']}")
+        stats[reason.split(" (")[0]] = stats.get(reason.split(" (")[0], 0) + 1
+        seen.add(key(job["id"]))
+    print(f"  dettagli {details} · chiamate AI {ai_calls} · esito {stats}")
+    return ok, len(profile["searches"]), stats
+
+
+def main() -> None:
+    state = load_state()
+    seen = set(state["seen"])
+    tot_ok = tot = 0
     try:
-        _evaluate(new, seen, stats)
+        for profile in PROFILES:
+            ok, n, _ = run_profile(profile, seen)
+            tot_ok += ok
+            tot += n
     finally:
         state["seen"] = list(seen)
         state["ai_spent_usd"] = state.get("ai_spent_usd", 0.0) + AI_STATE["spent"]
         if AI_STATE["out_of_credit"] and time.time() - state.get("ai_credit_warn", 0) > 24 * 3600:
             tg_send("💳 <b>Job bot</b>: credito Anthropic esaurito. Le offerte continuano "
-                    "ad arrivare, ma senza voto AI. Ricarica su console.anthropic.com.")
+                    "ad arrivare, ma senza voto AI. Ricarica su console.anthropic.com.",
+                    DEFAULT_CHAT_IDS)
             state["ai_credit_warn"] = time.time()
+        if tot and tot_ok == 0 and time.time() - state.get("last_warn", 0) > 12 * 3600:
+            tg_send("⚠️ <b>Job bot</b>: LinkedIn non risponde a nessuna ricerca. "
+                    "Controlla i log su GitHub Actions.", DEFAULT_CHAT_IDS)
+            state["last_warn"] = time.time()
         save_state(state)
-    print(f"Esito: {stats}")
-    print(f"Spesa AI stimata: questo giro ${AI_STATE['spent']:.4f} · "
-          f"totale ${state['ai_spent_usd']:.3f}")
-
-
-def _evaluate(new: list[dict], seen: set, stats: dict) -> None:
-    sent, details, ai_calls = 0, 0, 0
-    for job in new:
-        reason = excluded(job)  # pre-filtro su titolo/nome, senza scaricare il dettaglio
-        if reason is None:
-            if details >= MAX_DETAILS_PER_RUN:
-                continue  # resta "non vista": la valutiamo al prossimo giro
-            details += 1
-            if not fetch_detail(job):
-                continue  # errore: riprovo al prossimo giro
-            time.sleep(1.5)
-            reason = excluded(job)  # ora con il settore
-        if reason is None:
-            s, why = score(job)
-            if s >= MIN_SCORE:
-                ai = None
-                if AI_ENABLED and ai_calls < AI_MAX_CALLS_PER_RUN and not AI_STATE["out_of_credit"]:
-                    ai_calls += 1
-                    ai = ai_review(job)
-                    if ai:
-                        print(f"        AI {ai['voto']}/5 · {ai.get('sintesi', '')}")
-                if not notify(job, why, ai):
-                    print(f"  [{s:>3}] invio fallito    {job['title']} — riprovo al prossimo giro")
-                    continue  # resta non vista
-                sent += 1
-                time.sleep(3)  # Telegram: max ~20 messaggi/minuto per gruppo
-                reason = "inviata"
-            else:
-                reason = "poco pertinente"
-            print(f"  [{s:>3}] {reason:<16} {job['title']} — {job['company']}")
-        stats[reason] = stats.get(reason, 0) + 1
-        seen.add(job["id"])
-
-    print(f"Dettagli scaricati {details} · inviate {sent} · "
-          f"chiamate AI {ai_calls}{'' if AI_ENABLED else ' (AI disattivata)'}")
+    print(f"\nRicerche OK {tot_ok}/{tot} · spesa AI stimata: questo giro "
+          f"${AI_STATE['spent']:.4f} · totale ${state['ai_spent_usd']:.3f}")
+    if tot and tot_ok == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
