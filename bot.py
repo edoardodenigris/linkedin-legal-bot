@@ -68,7 +68,9 @@ REMOTE_KEYWORDS = [
     "compliance",
     "privacy specialist",
 ]
-REMOTE_LOCATION = "Italia"
+REMOTE_GEO_ID = "103350119"   # geoId LinkedIn dell'Italia (il testo "Italia" non basta)
+# Paracadute: scarta qualsiasi offerta la cui localita' non sia in Italia
+LOCATION_REQUIRED = re.compile(r"ital(ia|y|ien)", re.I)
 
 TIME_WINDOW_SEC = 7200        # ultime 2h (con dedup copre i ritardi del cron)
 MAX_DETAILS_PER_RUN = 60      # tetto alle pagine dettaglio per esecuzione
@@ -202,13 +204,14 @@ def get(url: str) -> requests.Response | None:
 def search(keyword: str, remote: bool = False) -> tuple[list[dict], bool]:
     params = {
         "keywords": keyword,
-        "location": REMOTE_LOCATION if remote else LOCATION,
+        "location": "Italia" if remote else LOCATION,
         "f_TPR": f"r{TIME_WINDOW_SEC}",
         "sortBy": "DD",
         "start": 0,
     }
     if remote:
         params["f_WT"] = 2          # 2 = full remote
+        params["geoId"] = REMOTE_GEO_ID
     else:
         params["distance"] = DISTANCE_MILES
     r = get(f"{SEARCH_URL}?{urlencode(params)}")
@@ -312,6 +315,8 @@ def score(job: dict) -> tuple[int, str]:
 
 
 def excluded(job: dict) -> str | None:
+    if job.get("location") and not LOCATION_REQUIRED.search(job["location"]):
+        return "fuori Italia"
     if TITLE_EXCLUDE.search(job["title"]):
         return "titolo escluso"
     if job.get("industry") and INDUSTRY_EXCLUDE.search(job["industry"]):
