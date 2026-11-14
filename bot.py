@@ -25,41 +25,63 @@ from bs4 import BeautifulSoup
 # CONFIG — tutto quello che serve modificare sta qui
 # =====================================================================
 
-# Ricerche su LinkedIn (LinkedIn cerca in titolo + descrizione)
+# Profilo cercato: legal in-house "generalista" (contratti, societario, IP/marchi,
+# compliance 231, privacy, contenzioso) in aziende tipo moda, automotive, retail, industria.
+
+# Ricerche su Milano e dintorni (LinkedIn cerca in titolo + descrizione)
 SEARCH_KEYWORDS = [
     "legal",
     "legal counsel",
+    "legal specialist",
+    "in-house counsel",
+    "legal affairs",
+    "legal manager",
+    "head of legal",
     "giurista",
     "ufficio legale",
     "affari legali",
+    "specialista legale",
     "contract manager",
     "contrattualistica",
     "paralegal",
     "compliance",
-    "regulatory",
-    "privacy",
+    "privacy specialist",
     "data protection",
-    "DPO",
-    "GDPR",
     "modello 231",
     "AI Act",
     "corporate governance",
     "segreteria societaria",
     "antitrust",
+    "trademark",
+    "intellectual property",
 ]
-
 LOCATION = "Milano, Lombardia, Italia"
 DISTANCE_MILES = 25           # ~40 km
+
+# Ricerche full remote su tutta Italia (sottoinsieme, per non appesantire)
+REMOTE_KEYWORDS = [
+    "legal counsel",
+    "legal specialist",
+    "legal",
+    "giurista",
+    "contract manager",
+    "compliance",
+    "privacy specialist",
+]
+REMOTE_LOCATION = "Italia"
+
 TIME_WINDOW_SEC = 7200        # ultime 2h (con dedup copre i ritardi del cron)
 MAX_DETAILS_PER_RUN = 60      # tetto alle pagine dettaglio per esecuzione
 MIN_SCORE = 3                 # soglia di pertinenza (vedi score())
 
 # --- Titolo: segnali forti (bastano da soli) ---
 TITLE_STRONG = [
-    r"legal", r"lawyer", r"counsel", r"giurist", r"legale", r"avvocat",
-    r"paralegal", r"contract\s*manag", r"contrattualistic", r"\bdpo\b",
-    r"data\s*protection", r"privacy", r"antitrust", r"corporate\s*secretar",
-    r"segreteria\s*societari", r"affari\s*(legali|societari)",
+    r"legal", r"lawyer", r"attorney", r"counsel", r"jurist", r"giurist", r"legale",
+    r"avvocat", r"paralegal", r"contract\s*(manag|special|admin)", r"contrattualistic",
+    r"\bdpo\b", r"data\s*protection", r"privacy", r"antitrust", r"litigation",
+    r"contenzios", r"corporate\s*secretar", r"segreteria\s*societari",
+    r"affari\s*(legali|societari)", r"trademark", r"\bmarchi\b", r"intellectual\s*property",
+    r"propriet[aà]\s*intellettuale", r"\bip\s*(counsel|specialist|manager)", r"brand\s*protection",
 ]
 # --- Titolo: segnali medi (servono conferme nella descrizione) ---
 TITLE_MEDIUM = [
@@ -69,10 +91,12 @@ TITLE_MEDIUM = [
 ]
 # --- Descrizione: termini "core" giuridici (almeno uno serve per i titoli medi) ---
 DESC_CORE = [
-    r"giurisprudenza", r"laurea\s+in\s+legge", r"law\s+degree", r"\bdiritto\b",
-    r"\blegal\b", r"ufficio\s+legale", r"avvocat", r"abilitazione\s+(all'esercizio|forense)",
-    r"bar\s+admission", r"contrattualistic", r"\bcontratti\b", r"\bcontracts?\b",
-    r"\bgiurid", r"\blegali?\b",
+    r"giurisprudenza", r"laurea\s+in\s+legge", r"law\s+degree", r"\bdiritto\s+(commerciale|societario|civile|del\s+lavoro|amministrativo|bancario|industriale|dei\s+contratti)",
+    r"(ufficio|area|funzione|direzione|consulenza|assistenza)\s+legal[ei]", r"affari\s+legali",
+    r"legal\s+(department|team|function|affairs|counsel|advice|support|matters)",
+    r"avvocat", r"abilitazione\s+(all'esercizio|forense)", r"bar\s+admission",
+    r"contrattualistic", r"redazione\s+(di\s+)?contratti", r"(drafting|negotiat\w*)\s+(of\s+)?(commercial\s+)?contracts",
+    r"\bgiuridic",
 ]
 # --- Descrizione: termini di dominio (ognuno distinto vale 1 punto) ---
 DESC_DOMAIN = {
@@ -95,13 +119,35 @@ DESC_DOMAIN = {
     "compliance": r"compliance",
     "segreteria societaria": r"segreteria\s+societaria|assemble[ae]\s+(dei\s+)?soci|board\s+meeting",
     "IP": r"propriet[aà]\s+intellettuale|intellectual\s+property",
+    "marchi": r"\bmarchi\b|trademark|brand\s+protection|anticontraffazione|counterfeit",
+    "licensing": r"licensing|contratti\s+di\s+licenza",
+    "distribuzione": r"(contratti|accordi)\s+di\s+(distribuzione|agenzia|franchising|fornitura)|"
+                     r"distribution\s+agreements?|franchis|dealer\s+agreements?|supply\s+agreements?",
+    "consumatori": r"codice\s+del\s+consumo|consumer\s+(law|protection)|product\s+liability|"
+                   r"responsabilit[aà]\s+(da\s+)?prodotto",
+    "societario": r"diritto\s+societario|corporate\s+law|operazioni\s+straordinarie|\bm&a\b",
 }
+
+# Frasi "di rito" a fondo annuncio: vengono tolte dalla descrizione prima dello scoring
+BOILERPLATE = re.compile(
+    r"2016/679|196/2003|101/2018|198/2006|903/77|215/2003|216/2003|"
+    r"ai\s+sensi\s+(del|della|dell'|degli)|informativa|trattamento\s+dei\s+(tuoi\s+)?dati|"
+    r"dati\s+personali|personal\s+data|privacy\s+(policy|notice|statement)|"
+    r"(entrambi|ambo)\s+i\s+sessi|pari\s+opportunit|equal\s+opportunit|"
+    r"candidat[iouae]\s+(sono\s+)?invitat|autorizz\w*\s+(il|al)\s+trattamento|"
+    r"\bl\.?\s*68/99|categorie\s+protette|"
+    r"(in\s+materia\s+di|normativa\s+(sulla|in\s+materia\s+di))\s+(protezione\s+dei\s+dati|privacy)|"
+    r"normativa\s+vigente|regolamento\s+(ue|europeo|\(ue\))\s*(n\.?\s*)?2016|gdpr\)?\s*$",
+    re.I,
+)
 
 # Esclusioni
 TITLE_EXCLUDE = re.compile(
     r"praticant|stage\b|stagista|tirocin|\bintern\b|internship|"
     r"sales|commerciale|venditor|engineer|developer|sviluppator|"
-    r"\bit\s+(compliance|security)|cyber|infermier|medic[oa]\b",
+    r"\bit\s+(compliance|security)|cyber|infermier|medic[oa]\b|medico\s+legale|"
+    r"legal\s+entit|contabil|accountant|regulatory\s+affairs|affari\s+regolatori|"
+    r"quality|qualit[aà]|\bhse\b|\behs\b|ambiente\s+e\s+sicurezza",
     re.I,
 )
 # Studi legali: per settore LinkedIn (affidabile) + fallback sul nome
@@ -153,15 +199,18 @@ def get(url: str) -> requests.Response | None:
 
 
 # ---------------------------------------------------------------- SEARCH
-def search(keyword: str) -> tuple[list[dict], bool]:
+def search(keyword: str, remote: bool = False) -> tuple[list[dict], bool]:
     params = {
         "keywords": keyword,
-        "location": LOCATION,
-        "distance": DISTANCE_MILES,
+        "location": REMOTE_LOCATION if remote else LOCATION,
         "f_TPR": f"r{TIME_WINDOW_SEC}",
         "sortBy": "DD",
         "start": 0,
     }
+    if remote:
+        params["f_WT"] = 2          # 2 = full remote
+    else:
+        params["distance"] = DISTANCE_MILES
     r = get(f"{SEARCH_URL}?{urlencode(params)}")
     if r is None:
         return [], False
@@ -179,6 +228,7 @@ def search(keyword: str) -> tuple[list[dict], bool]:
             "location": t("span.job-search-card__location"),
             "posted": t("time"),
             "url": f"https://www.linkedin.com/jobs/view/{m.group(1)}/",
+            "remote": remote,
         })
     return jobs, True
 
@@ -211,6 +261,20 @@ def hits(rxs, text):
     return [rx.pattern for rx in rxs if rx.search(text)]
 
 
+def strip_boilerplate(text: str) -> str:
+    """Toglie le frasi standard su privacy/GDPR/pari opportunita'."""
+    sentences = re.split(r"(?<=[.!?;])\s+|\s{2,}|\n", text)
+    keep = DESC_DOMAIN_RX["231"], DESC_DOMAIN_RX["AI Act"], DESC_DOMAIN_RX["OdV"]
+    return " ".join(
+        x for x in sentences
+        if not BOILERPLATE.search(x) or any(k.search(x) for k in keep)
+    )
+
+
+# termini troppo generici per far passare da soli un titolo non legal
+WEAK_DOMAIN = {"normativa", "compliance", "regulatory", "privacy", "GDPR"}
+
+
 def score(job: dict) -> tuple[int, str]:
     """
     Regole:
@@ -218,10 +282,13 @@ def score(job: dict) -> tuple[int, str]:
       - titolo medio                         -> +1, e la descrizione deve avere
                                                 almeno 1 termine 'core' giuridico
       - ogni termine di dominio distinto nella descrizione -> +1 (max 4)
-      - descrizione senza titolo pertinente  -> passa solo con core + >=4 di dominio
+      - descrizione senza titolo pertinente  -> passa solo con core + >=3 termini
+                                                di dominio specifici (non generici)
+    Prima dello scoring la descrizione viene ripulita dalle frasi di rito
+    (informativa privacy, GDPR, pari opportunita').
     Ritorna (punteggio, motivo leggibile).
     """
-    title, desc = job["title"], job.get("description", "")
+    title, desc = job["title"], strip_boilerplate(job.get("description", ""))
     strong = hits(TITLE_STRONG_RX, title)
     medium = hits(TITLE_MEDIUM_RX, title)
     core = hits(DESC_CORE_RX, desc)
@@ -232,7 +299,7 @@ def score(job: dict) -> tuple[int, str]:
         s += 3
     elif medium:
         s += 1 if core else -10
-    elif not (core and len(domain) >= 4):
+    elif not (core and len([d for d in domain if d not in WEAK_DOMAIN]) >= 3):
         s -= 10
     s += min(len(domain), 4)
 
@@ -295,7 +362,7 @@ def tg_send(text: str) -> bool:
 
 def notify(job: dict, why: str) -> bool:
     lines = [
-        f"🆕 <b>{esc(job['title'])}</b>",
+        ("🏠 <b>REMOTO</b> · " if job.get("remote") else "🆕 ") + f"<b>{esc(job['title'])}</b>",
         f"🏢 {esc(job['company'])}" + (f"  ·  {esc(job['industry'])}" if job.get("industry") else ""),
         f"📍 {esc(job['location'])}  ·  {esc(job['posted'])}"
         + (f"  ·  {esc(job['seniority'])}"
@@ -329,11 +396,13 @@ def main() -> None:
     # 1. ricerca
     found: dict[str, dict] = {}
     ok_searches = 0
-    for kw in SEARCH_KEYWORDS:
-        jobs, ok = search(kw)
+    searches = [(kw, False) for kw in SEARCH_KEYWORDS] + [(kw, True) for kw in REMOTE_KEYWORDS]
+    for kw, remote in searches:
+        jobs, ok = search(kw, remote)
         ok_searches += ok
         for j in jobs:
-            found.setdefault(j["id"], j)
+            prev = found.setdefault(j["id"], j)
+            prev["remote"] = prev["remote"] or j["remote"]
         time.sleep(3)
 
     # Se LinkedIn ci blocca del tutto: avviso su Telegram (max 1 ogni 12h) e fallisco
@@ -346,7 +415,7 @@ def main() -> None:
         sys.exit(1)
 
     new = [j for jid, j in found.items() if jid not in seen]
-    print(f"Ricerche OK {ok_searches}/{len(SEARCH_KEYWORDS)} · "
+    print(f"Ricerche OK {ok_searches}/{len(searches)} · "
           f"offerte trovate {len(found)} · nuove {len(new)}")
 
     # 2-5. valutazione (lo stato viene salvato anche se qualcosa va storto)
