@@ -21,6 +21,19 @@ EUROPE = (
     r"slovenia|slovakia|bulgaria|malta|cyprus"
 )
 
+# Localita' "pan-europee" (lavori da qualsiasi paese EU, o lista di sedi)
+PAN_EUROPE = ITALY + r"|europ|\beu\b|emea|remot|multiple|various|several|anywhere"
+# Frasi in descrizione che confermano che si puo' lavorare dall'Italia / da tutta Europa
+EU_ANYWHERE = (
+    r"ital(ia|y|ian)|milan|rome\b|roma\b|"
+    r"anywhere\s+in\s+(the\s+)?(eu|europe|emea)|"
+    r"(from|in|across|within)\s+(any|all)\s+(of\s+)?(the\s+)?(eu|european|emea)\s*(countr|member|location)?|"
+    r"(across|within|throughout)\s+(the\s+)?(eu|europe|emea)|"
+    r"remote[^.]{0,40}\b(eu|europe|emea)\b|(eu|europe|emea)[^.]{0,25}remote|"
+    r"(eu|european|emea)[- ]based|any\s+(eu|european)\s+countr|"
+    r"(one|any)\s+of\s+(our\s+)?(offices|hubs|locations)|choose\s+(your|from|between)[^.]{0,30}(office|hub|location)"
+)
+
 LOCATIONS = {
     # nome: parametri LinkedIn + regex che la localita' dell'annuncio deve rispettare
     "milano":  {"params": {"location": "Milano, Lombardia, Italia", "distance": 25}, "allow": ITALY},
@@ -29,8 +42,12 @@ LOCATIONS = {
     "italia_remote": {
         "params": {"location": "Italia", "geoId": "103350119", "f_WT": 2}, "allow": ITALY, "remote": True,
     },
+    # Remoto Europa: tiene gli annunci "pan-europei" o che includono l'Italia.
+    # Se la localita' e' un singolo paese estero (es. "Berlin, Germany"), l'annuncio
+    # passa solo se la DESCRIZIONE dice che si puo' lavorare da tutta Europa / dall'Italia.
     "europa_remote": {
-        "params": {"location": "European Union", "geoId": "91000000", "f_WT": 2}, "allow": EUROPE, "remote": True,
+        "params": {"location": "European Union", "geoId": "91000000", "f_WT": 2},
+        "allow": PAN_EUROPE, "allow_if_desc": EU_ANYWHERE, "outer": EUROPE, "remote": True,
     },
 }
 
