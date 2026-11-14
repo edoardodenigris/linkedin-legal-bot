@@ -167,6 +167,14 @@ COMPANY_EXCLUDE = re.compile(
 STATE_FILE = Path(__file__).with_name("seen.json")
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT_IDS = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+PROFILO = os.environ.get("PROFILO", "").strip()
+AI_MODEL = "claude-haiku-5-5"
+AI_MAX_CALLS_PER_RUN = 30          # tetto di sicurezza sui costi
+AI_ENABLED = bool(ANTHROPIC_API_KEY and PROFILO)
+# Prezzi Haiku 5.5 (USD per milione di token, prompt < 100K) per stimare la spesa
+AI_PRICE_IN, AI_PRICE_OUT = 0.10, 0.50
+AI_STATE = {"spent": 0.0, "out_of_credit": False}   # aggiornato durante l'esecuzione
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
@@ -331,7 +339,7 @@ def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def tg_send(text: str) -> bool:
+def tg_send(text: str, silent: bool = False) -> bool:
     """Invia a tutte le chat. Riprova su errori temporanei (5xx, 429, rete).
     Ritorna False se dopo i tentativi l'invio non e' riuscito."""
     ok_all = True
@@ -341,7 +349,8 @@ def tg_send(text: str) -> bool:
                 r = requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                     json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                          "disable_web_page_preview": True},
+                          "disable_web_page_preview": True,
+                          "disable_notification": silent},
                     timeout=20,
                 )
             except requests.RequestException as e:
@@ -365,17 +374,102 @@ def tg_send(text: str) -> bool:
     return ok_all
 
 
-def notify(job: dict, why: str) -> bool:
+AI_SYSTEM = """Sei un assistente che valuta offerte di lavoro per una candidata.
+Ecco il suo profilo:
+
+<profilo>
+{profilo}
+</profilo>
+
+Valuta quanto l'offerta che ricevi e' adatta a lei, seguendo il profilo (in particolare
+la sezione su cosa escludere). Rispondi SOLO con un oggetto JSON valido, senza testo
+prima o dopo, con questi campi:
+{{
+  "voto": intero da 1 a 5 (5 = perfetta, 1 = da scartare),
+  "in_house": true se e' un ruolo dentro un'azienda o un ente, false se studio legale o societa' di consulenza,
+  "seniority": stringa breve, es. "junior", "mid (3-5 anni)", "senior (7+ anni)", "non indicata",
+  "sintesi": massimo 15 parole in italiano su cosa si fa concretamente nel ruolo,
+  "attenzione": stringa breve con eventuali requisiti o condizioni che potrebbero escluderla
+                (lingue particolari, trasferte, contratto a termine, sede diversa), "" se nessuno
+}}"""
+
+
+def ai_review(job: dict) -> dict | None:
+    """Chiede a Claude Haiku una valutazione dell'offerta. None se qualcosa va storto."""
+    desc = strip_boilerplate(job.get("description", ""))[:6000]
+    ad = (
+        f"Titolo: {job['title']}\nAzienda: {job['company']}\n"
+        f"Settore: {job.get('industry') or 'n.d.'}\nLocalita': {job['location']}"
+        f"{' (full remote)' if job.get('remote') else ''}\n"
+        f"Seniority LinkedIn: {job.get('seniority') or 'n.d.'}\n\nDescrizione:\n{desc}"
+    )
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": AI_MODEL,
+                "max_tokens": 400,
+                "system": AI_SYSTEM.format(profilo=PROFILO),
+                "messages": [{"role": "user", "content": ad}],
+            },
+            timeout=60,
+        )
+        if not r.ok:
+            print(f"[warn] AI HTTP {r.status_code}: {r.text[:200]}")
+            if "credit balance" in r.text.lower():
+                AI_STATE["out_of_credit"] = True
+            return None
+        body = r.json()
+        u = body.get("usage", {})
+        AI_STATE["spent"] += (u.get("input_tokens", 0) * AI_PRICE_IN
+                              + u.get("output_tokens", 0) * AI_PRICE_OUT) / 1e6
+        text = "".join(b.get("text", "") for b in body.get("content", []))
+        m = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(m.group(0)) if m else None
+        if not data or not isinstance(data.get("voto"), int):
+            print(f"[warn] AI risposta non valida: {text[:200]}")
+            return None
+        data["voto"] = max(1, min(5, data["voto"]))
+        return data
+    except (requests.RequestException, ValueError, json.JSONDecodeError) as e:
+        print(f"[warn] AI errore: {e}")
+        return None
+
+
+def notify(job: dict, why: str, ai: dict | None = None) -> bool:
+    if ai:
+        v = ai["voto"]
+        badge = "🔥" if v >= 4 else ("⬇️" if v <= 2 else "🆗")
+        head = f"{badge} <b>{v}/5</b> · "
+    else:
+        head = "🆕 "
+    if job.get("remote"):
+        head += "🏠 <b>REMOTO</b> · "
     lines = [
-        ("🏠 <b>REMOTO</b> · " if job.get("remote") else "🆕 ") + f"<b>{esc(job['title'])}</b>",
+        head + f"<b>{esc(job['title'])}</b>",
         f"🏢 {esc(job['company'])}" + (f"  ·  {esc(job['industry'])}" if job.get("industry") else ""),
-        f"📍 {esc(job['location'])}  ·  {esc(job['posted'])}"
-        + (f"  ·  {esc(job['seniority'])}"
-           if job.get("seniority") and "applicab" not in job["seniority"].lower() else ""),
-        f"🔎 <i>{esc(why)}</i>",
-        job["url"],
+        f"📍 {esc(job['location'])}  ·  {esc(job['posted'])}",
     ]
-    return tg_send("\n".join(lines))
+    if ai:
+        if ai.get("sintesi"):
+            lines.append(f"📝 {esc(str(ai['sintesi']))}")
+        sen = str(ai.get("seniority") or "")
+        if sen and "non indicat" not in sen.lower():
+            lines.append(f"👤 {esc(sen)}")
+        if ai.get("in_house") is False:
+            lines.append("🚫 <i>Sembra studio legale / consulenza</i>")
+        if ai.get("attenzione"):
+            lines.append(f"⚠️ {esc(str(ai['attenzione']))}")
+    else:
+        lines.append(f"🔎 <i>{esc(why)}</i>")
+    lines.append(job["url"])
+    # voto basso: arriva lo stesso, ma senza suono
+    return tg_send("\n".join(lines), silent=bool(ai and ai["voto"] <= 2))
 
 
 # ---------------------------------------------------------------- STATE
@@ -429,12 +523,19 @@ def main() -> None:
         _evaluate(new, seen, stats)
     finally:
         state["seen"] = list(seen)
+        state["ai_spent_usd"] = state.get("ai_spent_usd", 0.0) + AI_STATE["spent"]
+        if AI_STATE["out_of_credit"] and time.time() - state.get("ai_credit_warn", 0) > 24 * 3600:
+            tg_send("💳 <b>Job bot</b>: credito Anthropic esaurito. Le offerte continuano "
+                    "ad arrivare, ma senza voto AI. Ricarica su console.anthropic.com.")
+            state["ai_credit_warn"] = time.time()
         save_state(state)
     print(f"Esito: {stats}")
+    print(f"Spesa AI stimata: questo giro ${AI_STATE['spent']:.4f} · "
+          f"totale ${state['ai_spent_usd']:.3f}")
 
 
 def _evaluate(new: list[dict], seen: set, stats: dict) -> None:
-    sent, details = 0, 0
+    sent, details, ai_calls = 0, 0, 0
     for job in new:
         reason = excluded(job)  # pre-filtro su titolo/nome, senza scaricare il dettaglio
         if reason is None:
@@ -448,7 +549,13 @@ def _evaluate(new: list[dict], seen: set, stats: dict) -> None:
         if reason is None:
             s, why = score(job)
             if s >= MIN_SCORE:
-                if not notify(job, why):
+                ai = None
+                if AI_ENABLED and ai_calls < AI_MAX_CALLS_PER_RUN and not AI_STATE["out_of_credit"]:
+                    ai_calls += 1
+                    ai = ai_review(job)
+                    if ai:
+                        print(f"        AI {ai['voto']}/5 · {ai.get('sintesi', '')}")
+                if not notify(job, why, ai):
                     print(f"  [{s:>3}] invio fallito    {job['title']} — riprovo al prossimo giro")
                     continue  # resta non vista
                 sent += 1
@@ -460,7 +567,8 @@ def _evaluate(new: list[dict], seen: set, stats: dict) -> None:
         stats[reason] = stats.get(reason, 0) + 1
         seen.add(job["id"])
 
-    print(f"Dettagli scaricati {details} · inviate {sent}")
+    print(f"Dettagli scaricati {details} · inviate {sent} · "
+          f"chiamate AI {ai_calls}{'' if AI_ENABLED else ' (AI disattivata)'}")
 
 
 if __name__ == "__main__":
