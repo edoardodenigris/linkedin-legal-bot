@@ -259,26 +259,51 @@ def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def tg_send(text: str) -> None:
+def tg_send(text: str) -> bool:
+    """Invia a tutte le chat. Riprova su errori temporanei (5xx, 429, rete).
+    Ritorna False se dopo i tentativi l'invio non e' riuscito."""
+    ok_all = True
     for chat_id in TG_CHAT_IDS:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=20,
-        ).raise_for_status()
+        for attempt in range(4):
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                          "disable_web_page_preview": True},
+                    timeout=20,
+                )
+            except requests.RequestException as e:
+                print(f"[warn] Telegram: {e}")
+                r = None
+            if r is not None and r.ok:
+                break
+            wait = 5 * (attempt + 1)
+            if r is not None:
+                print(f"[warn] Telegram HTTP {r.status_code}: {r.text[:150]}")
+                if r.status_code == 429:
+                    wait = r.json().get("parameters", {}).get("retry_after", wait) + 1
+                elif r.status_code < 500:
+                    break  # errore non temporaneo (es. chat id sbagliato): inutile riprovare
+            time.sleep(wait)
+        else:
+            ok_all = False
+            continue
+        if r is None or not r.ok:
+            ok_all = False
+    return ok_all
 
 
-def notify(job: dict, why: str) -> None:
+def notify(job: dict, why: str) -> bool:
     lines = [
         f"🆕 <b>{esc(job['title'])}</b>",
         f"🏢 {esc(job['company'])}" + (f"  ·  {esc(job['industry'])}" if job.get("industry") else ""),
         f"📍 {esc(job['location'])}  ·  {esc(job['posted'])}"
-        + (f"  ·  {esc(job['seniority'])}" if job.get("seniority") else ""),
+        + (f"  ·  {esc(job['seniority'])}"
+           if job.get("seniority") and "applicab" not in job["seniority"].lower() else ""),
         f"🔎 <i>{esc(why)}</i>",
         job["url"],
     ]
-    tg_send("\n".join(lines))
+    return tg_send("\n".join(lines))
 
 
 # ---------------------------------------------------------------- STATE
@@ -324,9 +349,18 @@ def main() -> None:
     print(f"Ricerche OK {ok_searches}/{len(SEARCH_KEYWORDS)} · "
           f"offerte trovate {len(found)} · nuove {len(new)}")
 
-    # 2-5. valutazione
-    sent, details = 0, 0
+    # 2-5. valutazione (lo stato viene salvato anche se qualcosa va storto)
     stats: dict[str, int] = {}
+    try:
+        _evaluate(new, seen, stats)
+    finally:
+        state["seen"] = list(seen)
+        save_state(state)
+    print(f"Esito: {stats}")
+
+
+def _evaluate(new: list[dict], seen: set, stats: dict) -> None:
+    sent, details = 0, 0
     for job in new:
         reason = excluded(job)  # pre-filtro su titolo/nome, senza scaricare il dettaglio
         if reason is None:
@@ -340,9 +374,11 @@ def main() -> None:
         if reason is None:
             s, why = score(job)
             if s >= MIN_SCORE:
-                notify(job, why)
+                if not notify(job, why):
+                    print(f"  [{s:>3}] invio fallito    {job['title']} — riprovo al prossimo giro")
+                    continue  # resta non vista
                 sent += 1
-                time.sleep(1)
+                time.sleep(3)  # Telegram: max ~20 messaggi/minuto per gruppo
                 reason = "inviata"
             else:
                 reason = "poco pertinente"
@@ -350,9 +386,7 @@ def main() -> None:
         stats[reason] = stats.get(reason, 0) + 1
         seen.add(job["id"])
 
-    print(f"Dettagli scaricati {details} · esito: {stats}")
-    state["seen"] = list(seen)
-    save_state(state)
+    print(f"Dettagli scaricati {details} · inviate {sent}")
 
 
 if __name__ == "__main__":
