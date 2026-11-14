@@ -117,7 +117,10 @@ def search(keyword: str, loc_key: str, extra: dict) -> tuple[list[dict], bool]:
         }
         # paracadute: la localita' dell'annuncio deve essere coerente con la ricerca
         if job["location"] and not re.search(loc["allow"], job["location"], re.I):
-            continue
+            if loc.get("allow_if_desc") and re.search(loc.get("outer", ""), job["location"], re.I):
+                job["desc_check"] = loc["allow_if_desc"]   # da confermare leggendo la descrizione
+            else:
+                continue
         jobs.append(job)
     return jobs, True
 
@@ -319,6 +322,8 @@ def run_profile(profile: dict, seen: set) -> tuple[int, int, dict]:
         for j in jobs:
             prev = found.setdefault(j["id"], j)
             prev["remote"] = prev["remote"] or j["remote"]
+            if not j.get("desc_check"):          # trovato anche da una ricerca "sicura"
+                prev.pop("desc_check", None)
         time.sleep(SEARCH_PAUSE_SEC)
 
     key = lambda jid: f"{profile['key']}:{jid}"
@@ -338,6 +343,9 @@ def run_profile(profile: dict, seen: set) -> tuple[int, int, dict]:
                 continue
             time.sleep(1.5)
             reason = profile["excluded"](job)
+            if reason is None and job.get("desc_check") and not re.search(
+                    job["desc_check"], job.get("description", ""), re.I):
+                reason = "remoto solo estero"
         if reason is None:
             s, why = profile["relevance"](job, strip_boilerplate(job.get("description", "")))
             if s >= profile["min_score"]:
