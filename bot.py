@@ -59,6 +59,10 @@ HEADERS = {
 SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 DETAIL_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{}"
 AI_STATE = {"spent": 0.0, "out_of_credit": False}
+# Interruttore: dopo N ricerche fallite di fila considero LinkedIn "bloccato" e smetto
+# di insistere per questo giro (evita esecuzioni lunghissime fatte solo di tentativi)
+MAX_CONSECUTIVE_FAILS = 5
+LI_STATE = {"consecutive_fails": 0, "tripped": False}
 
 
 def env_list(name: str) -> list[str]:
@@ -303,8 +307,15 @@ def run_profile(profile: dict, seen: set) -> tuple[int, int, dict]:
     found: dict[str, dict] = {}
     ok = 0
     for kw, loc_key in profile["searches"]:
+        if LI_STATE["tripped"]:
+            break
         jobs, success = search(kw, loc_key, profile["extra_params"])
         ok += success
+        LI_STATE["consecutive_fails"] = 0 if success else LI_STATE["consecutive_fails"] + 1
+        if LI_STATE["consecutive_fails"] >= MAX_CONSECUTIVE_FAILS:
+            LI_STATE["tripped"] = True
+            print(f"[warn] {MAX_CONSECUTIVE_FAILS} ricerche fallite di fila: LinkedIn sta "
+                  "bloccando, interrompo le ricerche per questo giro")
         for j in jobs:
             prev = found.setdefault(j["id"], j)
             prev["remote"] = prev["remote"] or j["remote"]
@@ -320,7 +331,7 @@ def run_profile(profile: dict, seen: set) -> tuple[int, int, dict]:
     for job in new:
         reason = profile["excluded"](job)
         if reason is None:
-            if details >= MAX_DETAILS_PER_PROFILE:
+            if details >= MAX_DETAILS_PER_PROFILE or LI_STATE["tripped"]:
                 continue  # resta non vista: la valuto al prossimo giro
             details += 1
             if not fetch_detail(job):
@@ -365,15 +376,17 @@ def main() -> None:
                     "ad arrivare, ma senza voto AI. Ricarica su console.anthropic.com.",
                     DEFAULT_CHAT_IDS)
             state["ai_credit_warn"] = time.time()
-        if tot and tot_ok == 0 and time.time() - state.get("last_warn", 0) > 12 * 3600:
-            tg_send("⚠️ <b>Job bot</b>: LinkedIn non risponde a nessuna ricerca. "
+        # avviso solo se il blocco persiste: 4 giri bloccati di fila (~1 ora)
+        state["blocked_runs"] = state.get("blocked_runs", 0) + 1 if LI_STATE["tripped"] else 0
+        if state["blocked_runs"] >= 4 and time.time() - state.get("last_warn", 0) > 12 * 3600:
+            tg_send("⚠️ <b>Job bot</b>: LinkedIn blocca le ricerche da circa un'ora. "
                     "Controlla i log su GitHub Actions.", DEFAULT_CHAT_IDS)
             state["last_warn"] = time.time()
         save_state(state)
     print(f"\nRicerche OK {tot_ok}/{tot} · spesa AI stimata: questo giro "
           f"${AI_STATE['spent']:.4f} · totale ${state['ai_spent_usd']:.3f}")
-    if tot and tot_ok == 0:
-        sys.exit(1)
+    if LI_STATE["tripped"]:
+        sys.exit(1)   # esecuzione segnata in rosso su GitHub: si vede subito che c'era un blocco
 
 
 if __name__ == "__main__":
