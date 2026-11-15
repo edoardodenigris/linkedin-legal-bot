@@ -231,7 +231,8 @@ EDO_TITLE_EXCLUDE = re.compile(
     r"junior|\bjr\b|\bintern\b|internship|stage\b|stagista|tirocin|graduate|neolaureat|"
     r"data\s*entry|data\s*engineer|software|developer|sviluppator|devops|"
     r"sales|account\s*(manager|executive)|commerciale|"
-    r"trainer|annotat|tutor|writer|teacher|docente|contabil",
+    r"trainer|annotat|tutor|writer|teacher|docente|contabil|"
+    r"\bsap\b|s/4\s*hana|\berp\b|migration|migrazione",
     re.I,
 )
 
