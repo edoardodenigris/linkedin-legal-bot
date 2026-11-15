@@ -1,9 +1,9 @@
 name: LinkedIn job alert
 
+# Lo avvia cron-job.org ogni 15 minuti (workflow_dispatch).
+# Niente "schedule" di GitHub: due "sveglie" insieme creano esecuzioni doppie e conflitti.
 on:
-  schedule:
-    - cron: "*/15 5-21 * * *"   # ogni 15 min, 6:00-22:59 ora italiana (UTC+1)
-  workflow_dispatch:            # per lanciarlo a mano
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -33,8 +33,31 @@ jobs:
           PROFILO: ${{ secrets.PROFILO }}
           PROFILO_EDOARDO: ${{ secrets.PROFILO_EDOARDO }}
       - name: Salva offerte già viste
+        if: always()
         run: |
           git config user.name "job-bot"
           git config user.email "job-bot@users.noreply.github.com"
-          git add seen.json
-          git diff --cached --quiet || git commit -m "update seen jobs" && git push
+          cp seen.json /tmp/mine.json
+          for i in 1 2 3; do
+            # riparte dall'ultima versione del repo e unisce le offerte viste (nessuna si perde)
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            python - <<'PY'
+          import json, pathlib
+          def load(p):
+              d = json.loads(pathlib.Path(p).read_text() or "[]")
+              return {"seen": d} if isinstance(d, list) else d
+          mine, theirs = load("/tmp/mine.json"), load("seen.json")
+          out = {**theirs, **mine}
+          out["seen"] = sorted(set(mine.get("seen", [])) | set(theirs.get("seen", [])))
+          for k in ("ai_spent_usd", "last_warn", "ai_credit_warn"):
+              out[k] = max(mine.get(k, 0), theirs.get(k, 0))
+          pathlib.Path("seen.json").write_text(json.dumps(out))
+          PY
+            git add seen.json
+            git diff --cached --quiet && exit 0
+            git commit -q -m "update seen jobs"
+            git push -q && exit 0
+            sleep 5
+          done
+          exit 1
