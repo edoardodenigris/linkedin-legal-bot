@@ -25,6 +25,7 @@ from profiles import KEEP_IN_BOILERPLATE, LOCATIONS, PROFILES
 # =====================================================================
 # CONFIG GENERALE
 # =====================================================================
+VERSION = "6.0 (AI tool-use)"
 TIME_WINDOW_SEC = 7200          # offerte delle ultime 2h (con dedup copre i ritardi)
 SEARCH_PAUSE_SEC = 2            # pausa tra una ricerca e l'altra
 MAX_DETAILS_PER_PROFILE = 40    # tetto pagine dettaglio per profilo per esecuzione
@@ -162,17 +163,30 @@ AI_SYSTEM = """Valuti offerte di lavoro per una persona che cerca lavoro. Ecco i
 Valuta quanto l'offerta che ricevi e' adatta a questa persona, seguendo il profilo
 (in particolare vincoli, esclusioni e soglie economiche). Se la retribuzione e' indicata
 in un'altra valuta o su base mensile/oraria, convertila in RAL annua lorda in euro.
-Rispondi SOLO con un oggetto JSON valido, senza testo prima o dopo, con questi campi:
-{{
-  "voto": intero da 1 a 5 (5 = perfetta, 1 = da scartare),
-  "in_target": true se il tipo di datore di lavoro e di ruolo rientra in cio' che cerca,
-  "seniority": stringa breve, es. "mid (3-5 anni)", "senior (7+ anni)", "manager", "non indicata",
-  "ral": RAL indicata nell'annuncio in forma breve (es. "55-65k EUR"), "" se non indicata,
-  "sintesi": massimo 15 parole in italiano su cosa si fa concretamente nel ruolo,
-  "attenzione": stringa breve con requisiti o condizioni che potrebbero escluderla
-                (lingue, trasferimento, trasferte, contratto a termine, RAL sotto soglia,
-                remoto non possibile dall'Italia), "" se nessuno
-}}"""
+Per i ruoli all'estero o remoti, verifica dalla descrizione se si puo' davvero lavorare
+dall'Italia. Rispondi chiamando lo strumento valuta_offerta."""
+
+AI_TOOL = {
+    "name": "valuta_offerta",
+    "description": "Registra la valutazione dell'offerta di lavoro.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "voto": {"type": "integer", "minimum": 1, "maximum": 5,
+                     "description": "5 = perfetta, 1 = da scartare"},
+            "in_target": {"type": "boolean",
+                          "description": "true se tipo di datore di lavoro e di ruolo rientrano in cio' che cerca"},
+            "seniority": {"type": "string",
+                          "description": "breve, es. 'mid (3-5 anni)', 'senior (7+ anni)', 'manager', 'non indicata'"},
+            "ral": {"type": "string", "description": "RAL indicata nell'annuncio (es. '55-65k EUR'), '' se assente"},
+            "sintesi": {"type": "string", "description": "max 15 parole in italiano su cosa si fa nel ruolo"},
+            "attenzione": {"type": "string",
+                           "description": "requisiti/condizioni che potrebbero escluderla (lingue, trasferimento, "
+                                          "remoto non possibile dall'Italia, RAL sotto soglia...), '' se nessuno"},
+        },
+        "required": ["voto", "in_target", "seniority", "ral", "sintesi", "attenzione"],
+    },
+}
 
 
 def ai_review(job: dict, profile_text: str) -> dict | None:
@@ -189,13 +203,15 @@ def ai_review(job: dict, profile_text: str) -> dict | None:
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": AI_MODEL, "max_tokens": 400,
+            json={"model": AI_MODEL, "max_tokens": 800,
                   "system": AI_SYSTEM.format(profilo=profile_text),
+                  "tools": [AI_TOOL],
+                  "tool_choice": {"type": "tool", "name": "valuta_offerta"},
                   "messages": [{"role": "user", "content": ad}]},
             timeout=60,
         )
         if not r.ok:
-            print(f"[warn] AI HTTP {r.status_code}: {r.text[:200]}")
+            print(f"[warn] AI HTTP {r.status_code}: {r.text[:300]}")
             if "credit balance" in r.text.lower():
                 AI_STATE["out_of_credit"] = True
             return None
@@ -203,15 +219,18 @@ def ai_review(job: dict, profile_text: str) -> dict | None:
         u = body.get("usage", {})
         AI_STATE["spent"] += (u.get("input_tokens", 0) * AI_PRICE_IN
                               + u.get("output_tokens", 0) * AI_PRICE_OUT) / 1e6
-        text = "".join(b.get("text", "") for b in body.get("content", []))
-        m = re.search(r"\{.*\}", text, re.S)
-        data = json.loads(m.group(0)) if m else None
-        if not data or not isinstance(data.get("voto"), int):
-            print(f"[warn] AI risposta non valida: {text[:200]}")
+        data = next((b.get("input") for b in body.get("content", [])
+                     if b.get("type") == "tool_use"), None)
+        if data is None:  # ripiego: cerca un JSON nel testo
+            text = "".join(b.get("text", "") for b in body.get("content", []))
+            m = re.search(r"\{.*\}", text, re.S)
+            data = json.loads(m.group(0)) if m else None
+        if not isinstance(data, dict) or "voto" not in data:
+            print(f"[warn] AI risposta non valida: {json.dumps(body)[:300]}")
             return None
-        data["voto"] = max(1, min(5, data["voto"]))
+        data["voto"] = max(1, min(5, int(float(str(data["voto"]).strip()))))
         return data
-    except (requests.RequestException, ValueError) as e:
+    except (requests.RequestException, ValueError, TypeError) as e:
         print(f"[warn] AI errore: {e}")
         return None
 
@@ -368,6 +387,7 @@ def run_profile(profile: dict, seen: set) -> tuple[int, int, dict]:
 
 
 def main() -> None:
+    print(f"bot.py versione {VERSION}")
     state = load_state()
     seen = set(state["seen"])
     tot_ok = tot = 0
