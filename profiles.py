@@ -25,13 +25,14 @@ EUROPE = (
 PAN_EUROPE = ITALY + r"|europ|\beu\b|emea|remot|multiple|various|several|anywhere"
 # Frasi in descrizione che confermano che si puo' lavorare dall'Italia / da tutta Europa
 EU_ANYWHERE = (
-    r"ital(ia|y|ian)|milan|rome\b|roma\b|"
-    r"anywhere\s+in\s+(the\s+)?(eu|europe|emea)|"
-    r"(from|in|across|within)\s+(any|all)\s+(of\s+)?(the\s+)?(eu|european|emea)\s*(countr|member|location)?|"
-    r"(across|within|throughout)\s+(the\s+)?(eu|europe|emea)|"
-    r"remote[^.]{0,40}\b(eu|europe|emea)\b|(eu|europe|emea)[^.]{0,25}remote|"
-    r"(eu|european|emea)[- ]based|any\s+(eu|european)\s+countr|"
-    r"(one|any)\s+of\s+(our\s+)?(offices|hubs|locations)|choose\s+(your|from|between)[^.]{0,30}(office|hub|location)"
+    r"\b(ital(ia|y)|milan[o]?)\b|"
+    r"(work|working|based|live|located|remote(ly)?)\s+(from\s+)?anywhere\s+in\s+(the\s+)?(eu|europe|emea)|"
+    r"remote(ly)?\s+(from|within|across|anywhere\s+in)\s+(any\s+)?(the\s+)?(eu|europe|emea|european)|"
+    r"(eu|europe|emea)[- ]wide\s+remote|fully\s+remote\s*[(\-–,:]\s*(eu|europe|emea)|"
+    r"(location|based)\s*:\s*(remote[,\s\-–/]*)?(eu|europe|emea)\b|"
+    r"any\s+(eu|european)\s+(member\s+)?(country|countries|state)|"
+    r"(one|any)\s+of\s+our\s+(european\s+)?(offices|hubs|locations)|"
+    r"choose\s+(your|from|between)[^.]{0,30}(office|hub|location)"
 )
 
 LOCATIONS = {
