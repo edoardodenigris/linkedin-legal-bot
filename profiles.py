@@ -219,6 +219,10 @@ EDOARDO_KEYWORDS = [
     "data science manager",
     "head of data",
     "AI manager",
+    "data lead",             # pesca "Data & AI Lead", "Data Team Lead"...
+    "AI lead",
+    "business intelligence",
+    "analytics lead",
 ]
 EDOARDO_LOCATIONS = ["milano", "verona", "bologna", "italia_remote", "europa_remote"]
 
@@ -257,7 +261,7 @@ EDOARDO = {
     "name": "Edoardo",
     "emoji": "📊",
     "searches": [(kw, loc) for kw in EDOARDO_KEYWORDS for loc in EDOARDO_LOCATIONS],
-    "extra_params": {"f_E": "4,5"},            # LinkedIn: 4 = Mid-Senior, 5 = Director
+    "extra_params": {},
     "excluded": edoardo_excluded,
     "relevance": edoardo_relevance,
     "min_score": 3,
