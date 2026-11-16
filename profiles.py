@@ -70,7 +70,7 @@ ALICE_KEYWORDS = [
     "specialista legale", "contract manager", "contrattualistica", "paralegal",
     "compliance", "privacy specialist", "data protection", "modello 231", "AI Act",
     "corporate governance", "segreteria societaria", "antitrust", "trademark",
-    "intellectual property",
+    "intellectual property", "regulatory", "affari regolatori",
 ]
 ALICE_REMOTE_KEYWORDS = [
     "legal counsel", "legal specialist", "legal", "giurista", "contract manager",
@@ -117,7 +117,9 @@ DESC_DOMAIN = {
     "whistleblowing": r"whistleblowing",
     "AML": r"antiriciclaggio|anti.?money\s+laundering",
     "normativa": r"normativ",
-    "regulatory": r"regulatory",
+    "regulatory": r"regulatory|regolator",
+    "autorità": r"\barera\b|\bconsob\b|\bmifid\b|\bemir\b|\bremit\b|\bivass\b|"
+                r"\bagcm\b|banca\s+d'italia|garante\s+(per\s+la\s+)?(privacy|protezione)",
     "compliance": r"compliance",
     "segreteria societaria": r"segreteria\s+societaria|assemble[ae]\s+(dei\s+)?soci|board\s+meeting",
     "IP": r"propriet[aà]\s+intellettuale|intellectual\s+property",
@@ -135,7 +137,7 @@ TITLE_EXCLUDE = re.compile(
     r"praticant|stage\b|stagista|tirocin|\bintern\b|internship|"
     r"sales|commerciale|venditor|engineer|developer|sviluppator|"
     r"\bit\s+(compliance|security)|cyber|infermier|medic[oa]\b|medico\s+legale|"
-    r"legal\s+entit|contabil|accountant|regulatory\s+affairs|affari\s+regolatori|"
+    r"legal\s+entit|contabil|accountant|"
     r"quality|qualit[aà]|\bhse\b|\behs\b|ambiente\s+e\s+sicurezza",
     re.I,
 )
